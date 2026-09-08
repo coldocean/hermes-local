@@ -19,14 +19,20 @@ $ bash bootstrap.sh --dry-run --no-dashboard
   ✓ python: python3.13 (3.13)
 
 ==> Creating the virtualenv at /home/user/hermes-local/venv
-  ✓ venv already exists — reusing it
+  would run: mkdir -p /home/user/hermes-local
+  would run: python3.13 -m venv /home/user/hermes-local/venv
+  ✓ venv ready
 
 ==> Installing hermes-agent from PyPI
-  ✓ installed: Hermes Agent v0.19.0 (2026.7.20)
+  would run: /home/user/hermes-local/venv/bin/pip install --upgrade pip
+  would run: /home/user/hermes-local/venv/bin/pip install hermes-agent
 
 ==> Running hermes postinstall (node, browser, ripgrep, ffmpeg)
   ! pip cannot ship these; without them Hermes' tools are crippled
   would run: /home/user/hermes-local/venv/bin/hermes postinstall
+
+==> Removing hermes-agent's 64K minimum-context floor
+  would run: /home/user/hermes-local/venv/bin/python scripts/unlock-context.py
 
 ==> Checking TLS root certificates
   would run: pip install --upgrade certifi; verify https reachability
@@ -42,28 +48,33 @@ $ bash bootstrap.sh --dry-run --no-dashboard
 
 ==> Pulling llama3.2:1b (this is the slow part)
   would run: ollama pull llama3.2:1b
+  ! could not read llama3.2:1b's native window from /api/show — using 32768
 
 ==> Pointing Hermes at local Ollama (HERMES_HOME=/tmp/dryhome)
   would run: /home/user/hermes-local/venv/bin/hermes config set model.provider custom
   would run: /home/user/hermes-local/venv/bin/hermes config set model.base_url http://localhost:11434/v1
   would run: /home/user/hermes-local/venv/bin/hermes config set model.default llama3.2:1b
-  would run: /home/user/hermes-local/venv/bin/hermes config set model.context_length 65536
-  would run: /home/user/hermes-local/venv/bin/hermes config set model.ollama_num_ctx 65536
+  would run: /home/user/hermes-local/venv/bin/hermes config set model.context_length 32768
+  would run: /home/user/hermes-local/venv/bin/hermes config set model.ollama_num_ctx 32768
 
 ==> Installing the 'hermes-model' switcher at /home/user/hermes-local/hermes-model
 
 ==> Done
 ```
 
-Two things to read out of that.
+Three things to read out of that.
 
 The **model** is sized to RAM: 3 GB → `llama3.2:1b`, with an honest warning that it's a wiring proof,
 not a working agent. A 16 GB box gets `llama3.1:8b` instead.
 
-The **window** is not. `context_length` and `ollama_num_ctx` are both 65536 on every machine, because
-Hermes hard-refuses anything under 64,000 tokens. An earlier version of this script scaled the window
-to RAM as well (8k / 16k / 32k) and never set `context_length` at all — which meant it produced a
-Hermes that could not start, on any machine, every time.
+The **64K floor gets patched out** right after the install — that's session 7. Without it, half the
+useful local models can't start at all.
+
+The **window** follows the model. It's read from Ollama's `/api/show` and used as-is, capped at
+131,072 unless you pass `--ctx`. Here the dry run couldn't reach Ollama (nothing is installed yet),
+so it falls back to 32,768 and says so. On a real run against a live server you'd see
+`llama3.2:1b native context window: 131072 tokens`. `context_length` and `ollama_num_ctx` always move
+together — Hermes caps the second by the first, so a mismatch silently shrinks your window.
 
 ---
 
@@ -92,13 +103,13 @@ $ hermes config get model.base_url
 model.base_url = http://localhost:11434/v1
 
 $ hermes config get model.default
-model.default = llama3.1:8b
+model.default = qwen2.5:32b
 
 $ hermes config get model.context_length
-model.context_length = 65536
+model.context_length = 32768
 
 $ hermes config get model.ollama_num_ctx
-model.ollama_num_ctx = 65536
+model.ollama_num_ctx = 32768
 
 $ hermes config path
 /home/user/hermes-local/testhome/config.yaml
@@ -110,15 +121,16 @@ Which lands in `config.yaml` as:
 model:
   provider: custom
   base_url: http://localhost:11434/v1
-  default: llama3.1:8b
-  context_length: 65536
-  ollama_num_ctx: 65536
+  default: qwen2.5:32b
+  context_length: 32768
+  ollama_num_ctx: 32768
 ```
 
-`context_length` is the one that matters — it short-circuits Hermes' context resolver before any
-probing happens. `ollama_num_ctx` only sizes the KV cache Ollama allocates, and Hermes *caps* it by
-`context_length`, never raises it. Set both, to the same number, or you get the 64K rejection in
-session 7.
+Both numbers are the model's *native* window, read from Ollama's `/api/show`. `context_length` is
+the one that matters — it short-circuits Hermes' context resolver before any probing happens.
+`ollama_num_ctx` only sizes the KV cache Ollama allocates, and Hermes *caps* it by `context_length`,
+never raises it. Set both, to the same number. Under stock hermes-agent a 32,768 window would be
+refused outright; session 7 is how that floor gets removed.
 
 ---
 
@@ -163,7 +175,7 @@ model burning its budget; if it stops mid-sentence, `max_tokens` isn't reaching 
 
 ```console
 $ export PATH="$HOME/hermes-local/venv/bin:$PATH"
-$ export OLLAMA_CONTEXT_LENGTH=65536
+$ export OLLAMA_CONTEXT_LENGTH=32768      # match your model's window
 $ export OLLAMA_FLASH_ATTENTION=1
 $ export OLLAMA_KV_CACHE_TYPE=q8_0
 $ [ -f "$HOME/hermes-local/certs.env" ] && . "$HOME/hermes-local/certs.env"
@@ -186,9 +198,9 @@ silently truncated.
 
 ---
 
-## 7. The 64K rejection, and getting out of it · expected shape
+## 7. Removing the 64K floor · captured (patch) / stub Ollama (switcher)
 
-This is the error every local install hits first:
+Stock Hermes refuses any model under 64,000 tokens, which rules out qwen2.5 (32,768) forever:
 
 ```console
 $ hermes config set model.default qwen2.5:32b
@@ -199,42 +211,114 @@ agent init failed: Model qwen2.5:32b has a context window of 32,768 tokens,
 which is below the minimum 64,000 required by Hermes Agent
 ```
 
-That is not a setting you can turn down — `MINIMUM_CONTEXT_LENGTH = 64_000` is a constant in
-`agent/model_metadata.py`, and 32,768 is qwen2.5's *native* window. The model can never pass. In the
-dashboard the same failure looks like a gateway that restarts forever while claiming to be running:
-each attempt fails in `agent_init`, the UI's websocket drops (`client_disconnect (1005)`) and
-reconnects.
+In the dashboard the same failure looks like a gateway that restarts forever while claiming to be
+running: each attempt fails in `agent_init`, the UI's websocket drops (`client_disconnect (1005)`)
+and reconnects.
 
-Use the switcher instead of `config set`, because it moves all three keys together:
+The window is a property of the weights, so it can't be raised. The constant can. This is real
+output against a pip install of `hermes-agent 0.19.0`:
 
 ```console
-$ hermes-model
-current: llama3.1:8b @ 65536 tokens
+$ ./venv/bin/python scripts/unlock-context.py --check
+hermes-agent at: /tmp/hv/lib/python3.13/site-packages
 
-MODEL                        WINDOW
-llama3.1:8b                  131072     ok
-qwen2.5:32b                  32768      TOO SMALL for Hermes (needs 64000+)
-mistral-nemo:12b             1024000    ok
-llama3.2:1b                  131072     ok
+  stock    agent/model_metadata.py
+  stock    agent/agent_init.py
+  stock    agent/conversation_compression.py
+  stock    run_agent.py
 
-$ hermes-model qwen2.5:32b
-refusing: qwen2.5:32b has a 32768-token window; hermes-agent requires 64000+.
-this is the "below the minimum 64,000" error you keep hitting.
+live MINIMUM_CONTEXT_LENGTH = 64000
 $ echo $?
 1
 
-$ hermes-model mistral-nemo:12b
-switched to mistral-nemo:12b @ 65536 tokens (native 1024000)
+$ ./venv/bin/python scripts/unlock-context.py
+hermes-agent at: /tmp/hv/lib/python3.13/site-packages
+
+  patched  agent/model_metadata.py
+  patched  agent/agent_init.py
+  patched  agent/conversation_compression.py
+  patched  run_agent.py
+
+64K floor removed. MINIMUM_CONTEXT_LENGTH is now 4096.
+Any model is selectable — Hermes will no longer refuse a small window.
+Trade-off: a 32K window still has to hold the system prompt + tool
+schemas, so long sessions compress earlier and more often.
+```
+
+Run it twice and nothing happens — a marker comment makes it idempotent:
+
+```console
+$ ./venv/bin/python scripts/unlock-context.py
+hermes-agent at: /tmp/hv/lib/python3.13/site-packages
+
+  ok       agent/model_metadata.py (already patched)
+  ok       agent/agent_init.py (already patched)
+  ok       agent/conversation_compression.py (already patched)
+  ok       run_agent.py (already patched)
+
+Nothing to do — already unlocked.
+```
+
+Every touched file is backed up to `<file>.hermes-local.orig` first, so it's reversible:
+
+```console
+$ ./venv/bin/python scripts/unlock-context.py --restore
+hermes-agent at: /tmp/hv/lib/python3.13/site-packages
+
+  restored agent/model_metadata.py
+  restored agent/agent_init.py
+  restored agent/conversation_compression.py
+  restored run_agent.py
+
+4 file(s) restored. The 64K floor is back in force.
+```
+
+`bootstrap.sh` runs the patch for you after pip and after `postinstall`. **Re-run it after every
+`hermes update` or `pip install --upgrade hermes-agent`** — an upgrade rewrites site-packages and
+restores the floor.
+
+With the floor gone, the switcher stops refusing things. Output below is the real script talking to
+a stub Ollama, so the model list is a fixture:
+
+```console
+$ hermes-model
+current: qwen2.5:32b @ 32768 tokens
+
+MODEL                        WINDOW
+llama3.1:8b                  131072     roomy
+qwen2.5:32b                  32768      tight — compresses early, but allowed
+mistral-nemo:12b             1024000    roomy
+llama3.2:1b                  131072     roomy
+
+$ hermes-model qwen2.5:32b
+note: qwen2.5:32b has a 32768-token window. That is tight for an agent — the system
+      prompt + tool schemas eat a fixed chunk of it, so sessions compress
+      early. Switching anyway; the 64K floor was patched out.
+switched to qwen2.5:32b @ 32768 tokens (native 32768)
 restart the gateway to pick it up:  ~/hermes-local/venv/bin/hermes dashboard --stop && ~/hermes-local/venv/bin/hermes dashboard
+$ echo $?
+0
+
+$ HERMES_CTX=16384 hermes-model qwen2.5:32b
+note: qwen2.5:32b has a 32768-token window. That is tight for an agent — the system
+      prompt + tool schemas eat a fixed chunk of it, so sessions compress
+      early. Switching anyway; the 64K floor was patched out.
+switched to qwen2.5:32b @ 16384 tokens (native 32768)
+
+$ hermes-model mistral-nemo:12b
+switched to mistral-nemo:12b @ 131072 tokens (native 1024000)
 
 $ hermes-model nope:7b
 model 'nope:7b' not found on http://localhost:11434 — run: ollama pull nope:7b
+$ echo $?
+1
 ```
 
-The WINDOW column is each model's *native* window, read from Ollama's `/api/show`. It is a property
-of the weights — no config can raise it, which is why the fix is switching models, not tuning
-numbers. Note the switch lands at 65536, not 1024000: `hermes-model` asks for 64K (override with
-`HERMES_CTX`) and only clamps *down* if the model is smaller.
+The WINDOW column is each model's *native* window from `/api/show`. Two things the switcher still
+does: it moves `model.default`, `model.context_length` and `model.ollama_num_ctx` together (changing
+one alone is what makes switching feel cursed), and it never asks for more than the model has.
+`mistral-nemo` lands at 131,072 rather than its advertised 1,024,000 — that is the sanity cap; pass
+`HERMES_CTX=1024000` if you really want to try holding it.
 
 ---
 

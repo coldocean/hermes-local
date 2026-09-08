@@ -4,19 +4,26 @@
 #
 #   bash bootstrap.sh                 # install + configure + open dashboard
 #   bash bootstrap.sh --model llama3.1:8b
-#   bash bootstrap.sh --ctx 131072    # bigger window (more RAM per token)
+#   bash bootstrap.sh --ctx 131072    # cap the window (more RAM per token)
 #   bash bootstrap.sh --no-dashboard
 #   bash bootstrap.sh --dry-run       # print the plan, touch nothing
+#   bash bootstrap.sh --keep-64k-guard  # leave hermes-agent's 64K floor alone
 #
-# THE 64K RULE. Hermes refuses to start on any model whose context window is
-# under 64,000 tokens (agent/model_metadata.py: MINIMUM_CONTEXT_LENGTH=64000,
-# enforced in agent/agent_init.py). That rejection is what produces
+# THE 64K FLOOR — AND HOW THIS SCRIPT REMOVES IT. Stock hermes-agent refuses to
+# start on any model whose context window is under 64,000 tokens
+# (agent/model_metadata.py: MINIMUM_CONTEXT_LENGTH = 64_000, raised in
+# agent/agent_init.py and agent/conversation_compression.py). That is what
+# produces
 #   "agent init failed: Model X has a context window of 32,768 tokens,
 #    which is below the minimum 64,000 required by Hermes Agent"
-# So this script only offers models with a >=64K NATIVE window, pins
-# model.context_length AND model.ollama_num_ctx to the same value, and refuses
-# to configure a model that cannot honestly reach 64K. qwen2.5 (32,768) and
-# qwen3 (40,960 on Ollama) can never pass — they are rejected by name.
+# and it locks out plenty of usable local models (qwen2.5 = 32,768, qwen3 =
+# 40,960 as Ollama ships it). This script runs scripts/unlock-context.py over
+# your own install to drop the constant to 4096 and delete both raise sites, so
+# ANY model is selectable. Windows are then set to each model's NATIVE size
+# instead of a forced 65,536. Pass --keep-64k-guard to opt out.
+#
+# Re-run the unlock after any 'pip install --upgrade hermes-agent' / 'hermes
+# update' — an upgrade rewrites site-packages and puts the floor back.
 #
 # Safe to re-run: every step checks before it acts.
 # Verified against hermes-agent 0.19.0 (pip) on Python 3.13.
@@ -33,23 +40,35 @@ DASH_HOST="${DASH_HOST:-127.0.0.1}"
 MODEL=""
 WANT_DASH=1
 DRY=0
+UNLOCK=1
 
-# Hermes' hard floor is 64,000. 65,536 is the nearest power of two above it and
-# the value we pin everywhere: model.context_length, model.ollama_num_ctx and
-# Ollama's own OLLAMA_CONTEXT_LENGTH. Raise it only if you have the RAM.
-MIN_CTX=65536
-CTX="${HERMES_CTX:-$MIN_CTX}"
+# CTX is a CAP, not a target. Empty means "use whatever the model natively
+# supports" — 32,768 for qwen2.5, 131,072 for llama3.1, 1,024,000 for
+# mistral-nemo. Set --ctx / HERMES_CTX to clamp it down when RAM is tight;
+# the KV cache is what a big window actually costs.
+CTX="${HERMES_CTX:-}"
+
+# Windows below this are legal after the unlock but genuinely tight: Hermes'
+# system prompt + tool schemas are a large fixed prefix, so sessions compress
+# early. Used for warnings only — nothing is refused.
+TIGHT_CTX=64000
+
+# Some models advertise a native window nobody can actually hold in RAM
+# (mistral-nemo says 1,024,000). Without --ctx we default no higher than this;
+# pass --ctx explicitly to go bigger.
+SANE_MAX=131072
 
 while [ $# -gt 0 ]; do
   case "$1" in
-    --model)         MODEL="${2:?--model needs a value}"; shift 2 ;;
-    --ctx)           CTX="${2:?--ctx needs a value}"; shift 2 ;;
-    --port)          DASH_PORT="${2:?}"; shift 2 ;;
-    --home)          export HERMES_HOME="${2:?}"; shift 2 ;;
-    --dir)           HERMES_DIR="${2:?}"; VENV="$HERMES_DIR/venv"; shift 2 ;;
-    --no-dashboard)  WANT_DASH=0; shift ;;
-    --dry-run)       DRY=1; shift ;;
-    -h|--help)       sed -n '2,25p' "$0"; exit 0 ;;
+    --model)          MODEL="${2:?--model needs a value}"; shift 2 ;;
+    --ctx)            CTX="${2:?--ctx needs a value}"; shift 2 ;;
+    --port)           DASH_PORT="${2:?}"; shift 2 ;;
+    --home)           export HERMES_HOME="${2:?}"; shift 2 ;;
+    --dir)            HERMES_DIR="${2:?}"; VENV="$HERMES_DIR/venv"; shift 2 ;;
+    --no-dashboard)   WANT_DASH=0; shift ;;
+    --keep-64k-guard) UNLOCK=0; shift ;;
+    --dry-run)        DRY=1; shift ;;
+    -h|--help)        sed -n '2,30p' "$0"; exit 0 ;;
     *) echo "unknown flag: $1" >&2; exit 2 ;;
   esac
 done
@@ -64,9 +83,9 @@ die()  { printf '\n  %sx%s %s\n' "$R" "$Z" "$*" >&2; exit 1; }
 run()  { if [ "$DRY" = 1 ]; then printf '  would run: %s\n' "$*"; else "$@"; fi; }
 have() { command -v "$1" >/dev/null 2>&1; }
 
-if [ "$CTX" -lt "$MIN_CTX" ] 2>/dev/null; then
-  die "--ctx $CTX is below Hermes' hard minimum of 64,000 (use $MIN_CTX or more)"
-fi
+# Where scripts/unlock-context.py lives, relative to this script.
+SELF_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]:-$0}")" && pwd)"
+UNLOCK_PY="$SELF_DIR/scripts/unlock-context.py"
 
 # ----------------------------- 1. machine ----------------------------------
 step "Inspecting this machine"
@@ -140,6 +159,44 @@ step "Running hermes postinstall (node, browser, ripgrep, ffmpeg)"
 warn "pip cannot ship these; without them Hermes' tools are crippled"
 run "$HERMES" postinstall || warn "postinstall reported problems — 'hermes doctor' will tell you which"
 
+# --------------------------- 4c. unlock ------------------------------------
+# Drop hermes-agent's MINIMUM_CONTEXT_LENGTH floor so any model is selectable.
+# Runs AFTER pip and AFTER postinstall, because either can rewrite the files.
+# Idempotent: a marker comment makes a second run a no-op, and
+# `unlock-context.py --restore` puts site-packages back byte-for-byte.
+unlock_context() {
+  [ "$UNLOCK" = 1 ] || { warn "--keep-64k-guard: leaving the 64K floor in place"; return 0; }
+  if [ ! -f "$UNLOCK_PY" ]; then
+    warn "scripts/unlock-context.py not found next to this script ($UNLOCK_PY)"
+    warn "  the 64K floor stays in force — models under 64K will be refused"
+    return 0
+  fi
+  if [ "$DRY" = 1 ]; then
+    echo "  would run: $VENV/bin/python $UNLOCK_PY"
+    return 0
+  fi
+  if "$VENV/bin/python" "$UNLOCK_PY" 2>&1 | sed 's/^/  /'; then
+    ok "context floor unlocked — any model window is now accepted"
+    return 0
+  fi
+  # Auto-detection reads the interpreter's own sys.path. If that missed (odd
+  # venv layout, python symlinked in from elsewhere), point it at the venv's
+  # site-packages directly before giving up.
+  for sp in "$VENV"/lib/python*/site-packages; do
+    [ -f "$sp/agent/model_metadata.py" ] || continue
+    if "$VENV/bin/python" "$UNLOCK_PY" --site-packages "$sp" 2>&1 | sed 's/^/  /'; then
+      ok "context floor unlocked — any model window is now accepted"
+      return 0
+    fi
+  done
+  warn "unlock-context.py failed. hermes-agent may have changed shape;"
+  warn "  the 64K floor is still in force. Run it by hand to see why:"
+  warn "    $VENV/bin/python $UNLOCK_PY"
+}
+
+step "Removing hermes-agent's 64K minimum-context floor"
+unlock_context
+
 # --------------------------- 4b. TLS roots ---------------------------------
 # python.org builds on macOS ship no root certificates, so every https call
 # from inside the venv dies with:
@@ -188,10 +245,16 @@ fi
 step "Setting up Ollama"
 
 # Ollama's own default window is 4096 and it silently truncates to it, which
-# would hand Hermes a sub-64K window no matter what config.yaml says. These
-# three env vars are what make a 64K KV cache both served and affordable:
-# flash attention + q8_0 KV roughly halves the cache footprint.
-export OLLAMA_CONTEXT_LENGTH="$CTX"
+# hands Hermes a tiny window no matter what config.yaml says. These three env
+# vars are what make a large KV cache both served and affordable: flash
+# attention + q8_0 KV roughly halves the cache footprint.
+#
+# The serve-wide ceiling has to be set before 'ollama serve' starts, i.e.
+# before we know which model gets picked, so it uses --ctx if given and 65,536
+# otherwise. Per-request model.ollama_num_ctx (section 7) is the value that
+# actually decides each call's window, and it is capped by this.
+SERVE_CTX="${CTX:-65536}"
+export OLLAMA_CONTEXT_LENGTH="$SERVE_CTX"
 export OLLAMA_FLASH_ATTENTION="${OLLAMA_FLASH_ATTENTION:-1}"
 export OLLAMA_KV_CACHE_TYPE="${OLLAMA_KV_CACHE_TYPE:-q8_0}"
 
@@ -210,11 +273,11 @@ fi
 # Is the API up? Start it in the background if not.
 if curl -fsS --max-time 3 "$OLLAMA_URL/api/tags" >/dev/null 2>&1; then
   ok "ollama api answering on $OLLAMA_URL"
-  warn "ollama was already running — it will NOT have picked up OLLAMA_CONTEXT_LENGTH=$CTX."
+  warn "ollama was already running — it will NOT have picked up OLLAMA_CONTEXT_LENGTH=$SERVE_CTX."
   warn "  macOS app users: quit Ollama, then in a terminal run"
-  warn "    OLLAMA_CONTEXT_LENGTH=$CTX OLLAMA_FLASH_ATTENTION=1 OLLAMA_KV_CACHE_TYPE=q8_0 ollama serve"
-  warn "  linux systemd: sudo systemctl edit ollama  ->  Environment=\"OLLAMA_CONTEXT_LENGTH=$CTX\""
-  warn "  (model.ollama_num_ctx below makes Hermes request $CTX per call regardless)"
+  warn "    OLLAMA_CONTEXT_LENGTH=$SERVE_CTX OLLAMA_FLASH_ATTENTION=1 OLLAMA_KV_CACHE_TYPE=q8_0 ollama serve"
+  warn "  linux systemd: sudo systemctl edit ollama  ->  Environment=\"OLLAMA_CONTEXT_LENGTH=$SERVE_CTX\""
+  warn "  (a running server caps every request at its own ceiling, whatever model.ollama_num_ctx asks for)"
 elif [ "$DRY" = 1 ]; then
   echo "  would run: ollama serve &"
 else
@@ -233,22 +296,11 @@ fi
 # ----------------------------- 6. model ------------------------------------
 step "Choosing a model"
 
-# Hermes is an AGENT: it lives on native tool calling. But tool calling alone is
-# not enough — the model must ALSO have a >=64K native window or agent init
-# refuses it. These families satisfy both (all 128K native):
-TOOL_FAMILIES="llama3.3 llama3.2 llama3.1 mistral-nemo mistral-large command-r devstral granite3.3 granite3.2 granite3.1"
+# Hermes is an AGENT: it lives on native tool calling. That is the one thing a
+# model genuinely has to have — the context floor is gone, tool calling is not
+# negotiable. These families all do native tool calls:
+TOOL_FAMILIES="llama3.3 llama3.2 llama3.1 mistral-nemo mistral-large mistral-small command-r devstral granite3.3 granite3.2 granite3.1 qwen3 qwen2.5"
 tool_capable() { for f in $TOOL_FAMILIES; do case "$1" in "$f"*) return 0 ;; esac; done; return 1; }
-
-# Tool-capable but PERMANENTLY under the 64K floor — never offer these.
-# qwen2.5 = 32,768 native. qwen3 = 40,960 as Ollama ships it. granite3.0 = 4,096.
-# mistral-small before 3.x = 32,768. Choosing one is the direct cause of
-# "below the minimum 64,000 required by Hermes Agent".
-too_small() {
-  case "$1" in
-    qwen2.5*|qwen2:*|qwen:*|qwen3*|granite3.0*|granite3:*|codellama*|phi3*|gemma2*) return 0 ;;
-  esac
-  return 1
-}
 
 # Ask Ollama what the model's real window is: model_info.*.context_length in
 # /api/show is the GGUF training max — the same field Hermes itself probes.
@@ -271,34 +323,25 @@ else
   echo "  no models downloaded yet"
 fi
 
-# Size to RAM. Budget = Q4 weights + the 64K KV cache, which is NOT free:
-# at q8_0 it costs roughly 2 GB (1B), 4 GB (3B), 4 GB (8B), 5 GB (12B),
-# 5 GB (24B), 10 GB (70B). The old table ignored this and recommended 32B
-# models on 32 GB boxes that then could not hold the window Hermes demands.
-if   [ "$RAM_GB" -lt 8 ];  then SIZED="llama3.2:1b";     NOTE="wiring proof only — too small to be a useful agent"
-elif [ "$RAM_GB" -lt 16 ]; then SIZED="llama3.2:3b";     NOTE="usable for simple tool calls; ~2 GB weights + ~4 GB window"
-elif [ "$RAM_GB" -lt 24 ]; then SIZED="llama3.1:8b";     NOTE="the sweet spot for an agent brain; ~5 GB + ~4 GB window"
-elif [ "$RAM_GB" -lt 48 ]; then SIZED="mistral-nemo:12b";NOTE="strong tool caller, 128K native; ~7 GB + ~5 GB window"
-elif [ "$RAM_GB" -lt 64 ]; then SIZED="devstral:24b";    NOTE="very strong on code/tools; ~14 GB + ~5 GB window"
-else                            SIZED="llama3.3:70b";    NOTE="~40 GB download + ~10 GB window"
+# Size to RAM. Budget = Q4 weights + the KV cache for the window you actually
+# run, which is not free: at q8_0 a 32K window costs roughly 1-3 GB and 128K
+# costs 4-10 GB depending on the model. Bigger model + smaller window is
+# usually the better trade on a fixed amount of RAM.
+if   [ "$RAM_GB" -lt 8 ];  then SIZED="llama3.2:1b";      NOTE="wiring proof only — too small to be a useful agent"
+elif [ "$RAM_GB" -lt 16 ]; then SIZED="llama3.2:3b";      NOTE="usable for simple tool calls; ~2 GB weights"
+elif [ "$RAM_GB" -lt 24 ]; then SIZED="llama3.1:8b";      NOTE="the sweet spot for an agent brain; ~5 GB weights, 128K native"
+elif [ "$RAM_GB" -lt 32 ]; then SIZED="qwen2.5:14b";      NOTE="stronger reasoning; ~9 GB weights, 32K native"
+elif [ "$RAM_GB" -lt 48 ]; then SIZED="qwen2.5:32b";      NOTE="strong local brain; ~20 GB weights, 32K native"
+elif [ "$RAM_GB" -lt 64 ]; then SIZED="devstral:24b";     NOTE="very strong on code/tools; ~14 GB weights, 128K native"
+else                            SIZED="llama3.3:70b";     NOTE="~40 GB download, 128K native"
 fi
 
 if [ -n "$MODEL" ]; then
-  if too_small "$MODEL"; then
-    die "'$MODEL' cannot run Hermes.
-  Its native context window is under the hard 64,000-token minimum that
-  hermes-agent enforces at startup (qwen2.5 = 32,768, qwen3 = 40,960).
-  No config value can raise it — setting model.context_length higher just
-  makes Ollama truncate silently and the agent still refuses to init.
-  Pick a 128K model instead, e.g.:  --model $SIZED"
-  fi
   tool_capable "$MODEL" || warn "'$MODEL' is not in a known tool-calling family — Hermes may fail to use tools"
 else
-  # Prefer something already on disk over a fresh multi-GB download,
-  # but never reuse a model that cannot clear the 64K floor.
+  # Prefer something already on disk over a fresh multi-GB download.
   MODEL=""
   for m in $INSTALLED; do
-    too_small "$m" && continue
     if tool_capable "$m"; then MODEL="$m"; break; fi
   done
   if [ -n "$MODEL" ]; then ok "reusing downloaded tool-capable model: $MODEL"
@@ -312,33 +355,48 @@ else
   run ollama pull "$MODEL"
 fi
 
-# Now that the weights are on disk, ask the GGUF itself rather than trusting
-# the family name. This is the check that would have caught qwen2.5:32b.
-if [ "$DRY" = 0 ]; then
-  NATIVE="$(native_ctx "$MODEL")"
-  if [ -z "$NATIVE" ]; then
-    warn "could not read $MODEL's native context window from /api/show — continuing"
-  elif [ "$NATIVE" -lt "$MIN_CTX" ]; then
-    die "$MODEL advertises a native context window of $NATIVE tokens.
-  hermes-agent refuses anything under 64,000 and will fail every agent init
-  with 'below the minimum 64,000 required by Hermes Agent'.
-  Pick a 128K model instead:  bash $0 --model $SIZED"
-  else
-    ok "$MODEL native context window: $NATIVE tokens (>= $MIN_CTX required)"
-    if [ "$NATIVE" -lt "$CTX" ]; then
-      warn "requested --ctx $CTX exceeds the model's $NATIVE — clamping to $NATIVE"
+# Ask the GGUF itself rather than trusting the family name, then run the model
+# at its NATIVE window — clamped down by --ctx / HERMES_CTX if you set one.
+# Nothing here refuses a model any more; a small window only gets a warning.
+# This runs in --dry-run too: the probe is a read-only GET, and resolving the
+# real number here is what keeps the dry run from printing a placeholder where
+# a token count belongs.
+NATIVE=""
+[ -x "$(command -v curl || true)" ] && NATIVE="$(native_ctx "$MODEL")"
+if [ -z "$NATIVE" ]; then
+  CTX="${CTX:-32768}"
+  warn "could not read $MODEL's native window from /api/show — using $CTX"
+else
+  ok "$MODEL native context window: $NATIVE tokens"
+  if [ -z "$CTX" ]; then
+    if [ "$NATIVE" -gt "$SANE_MAX" ]; then
+      CTX="$SANE_MAX"
+      ok "native window is $NATIVE — using $CTX (pass --ctx $NATIVE to hold the whole thing)"
+    else
       CTX="$NATIVE"
+      ok "using the full native window: $CTX tokens"
     fi
+  elif [ "$NATIVE" -lt "$CTX" ]; then
+    warn "--ctx $CTX exceeds the model's $NATIVE — clamping to $NATIVE"
+    CTX="$NATIVE"
+  else
+    ok "capping the window at your requested $CTX tokens (native $NATIVE)"
+  fi
+  if [ "$CTX" -lt "$TIGHT_CTX" ]; then
+    warn "$CTX tokens is a tight window for an agent: Hermes' system prompt +"
+    warn "  tool schemas are a large fixed prefix, so long sessions will start"
+    warn "  compressing early. It works — the floor is unlocked — but expect it."
   fi
 fi
 
 # ----------------------------- 7. config -----------------------------------
 step "Pointing Hermes at local Ollama (HERMES_HOME=$HERMES_HOME)"
 
-# There is no RAM-based tier here any more, and that is deliberate. The old
-# script scaled num_ctx to 8192/16384/32768 — every one of those is under the
-# 64,000 floor, so it configured a Hermes that could never start, on any
-# machine. The window is not negotiable; the MODEL is what you scale to RAM.
+# Both keys get the same number, and that number is the model's real window
+# (section 6), not a fixed 65,536. With the floor unlocked there is nothing to
+# satisfy — the only thing that matters is that config, the wire and the GGUF
+# all agree, so Hermes' status bar and its compression threshold reflect the
+# window Ollama is actually serving.
 NUM_CTX="$CTX"
 
 if [ "$DRY" = 0 ] && [ ! -f "$HERMES_HOME/config.yaml" ]; then
@@ -352,18 +410,18 @@ run "$HERMES" config set model.provider custom
 run "$HERMES" config set model.base_url "$OLLAMA_URL/v1"
 run "$HERMES" config set model.default "$MODEL"
 
-# model.context_length is the one that actually fixes the startup rejection.
-# In agent/model_metadata.py the resolver short-circuits on it before any probe
-# ("0. Explicit config override — user knows best"), so this value is what the
-# 64K guard in agent_init.py sees. Without it Hermes probes Ollama, gets
-# whatever num_ctx the server happens to serve, and rejects the model.
+# model.context_length is the value Hermes trusts above everything else: in
+# agent/model_metadata.py the resolver short-circuits on it before any probe
+# ("0. Explicit config override — user knows best"). Set it and you decide the
+# window; leave it out and Hermes takes whatever num_ctx the server happens to
+# report, which is 4096 on a default Ollama.
 run "$HERMES" config set model.context_length "$CTX"
 
 # model.ollama_num_ctx is what Hermes puts on the wire per request, because
 # Ollama otherwise defaults to a tiny window regardless of the GGUF. Note the
 # direction of the interaction in agent_init.py: context_length CAPS an
 # auto-detected num_ctx, it never raises it. Setting both to the same number
-# is the only combination that is self-consistent.
+# is the only combination that is self-consistent, whatever size you pick.
 run "$HERMES" config set model.ollama_num_ctx "$NUM_CTX"
 
 if [ "$DRY" = 0 ]; then
@@ -378,7 +436,8 @@ fi
 # ------------------------- 7b. model switcher ------------------------------
 # Switching models by hand is what keeps breaking: change model.default alone
 # and the stale context_length from the previous model is still in config, so
-# the next agent init fails. This helper moves all three together.
+# Hermes asks Ollama for a window the new model does not have. This helper
+# moves all three keys together and never refuses a model — it warns.
 step "Installing the 'hermes-model' switcher at $HERMES_DIR/hermes-model"
 
 if [ "$DRY" = 0 ]; then
@@ -387,12 +446,14 @@ if [ "$DRY" = 0 ]; then
 #!/usr/bin/env bash
 # Switch the local Hermes brain: model + context_length + num_ctx, together.
 #   hermes-model                 list installed models and their real windows
-#   hermes-model llama3.1:8b     switch to it
+#   hermes-model qwen2.5:32b     switch to it (any window — nothing is refused)
+#   HERMES_CTX=16384 hermes-model qwen2.5:32b   switch and cap the window
 set -euo pipefail
 HERMES="$HERMES"
 export HERMES_HOME="\${HERMES_HOME:-$HERMES_HOME}"
 OLLAMA_URL="\${OLLAMA_URL:-$OLLAMA_URL}"
-MIN_CTX=$MIN_CTX
+TIGHT_CTX=$TIGHT_CTX
+SANE_MAX=$SANE_MAX
 [ -f "$HERMES_DIR/certs.env" ] && . "$HERMES_DIR/certs.env"
 
 native_ctx() {
@@ -411,8 +472,8 @@ if [ \$# -eq 0 ]; then
                | sed -n 's/.*"name"[[:space:]]*:[[:space:]]*"\\([^"]*\\)".*/\\1/p'); do
     n="\$(native_ctx "\$m")"; n="\${n:-?}"
     if [ "\$n" = "?" ]; then mark="unknown"
-    elif [ "\$n" -lt "\$MIN_CTX" ]; then mark="TOO SMALL for Hermes (needs 64000+)"
-    else mark="ok"; fi
+    elif [ "\$n" -lt "\$TIGHT_CTX" ]; then mark="tight — compresses early, but allowed"
+    else mark="roomy"; fi
     printf '%-28s %-10s %s\\n' "\$m" "\$n" "\$mark"
   done
   exit 0
@@ -421,12 +482,15 @@ fi
 M="\$1"
 N="\$(native_ctx "\$M")"
 [ -n "\$N" ] || { echo "model '\$M' not found on \$OLLAMA_URL — run: ollama pull \$M" >&2; exit 1; }
-if [ "\$N" -lt "\$MIN_CTX" ]; then
-  echo "refusing: \$M has a \$N-token window; hermes-agent requires 64000+." >&2
-  echo "this is the \"below the minimum 64,000\" error you keep hitting." >&2
-  exit 1
+if [ -n "\${HERMES_CTX:-}" ]; then C="\$HERMES_CTX"
+elif [ "\$N" -gt "\$SANE_MAX" ]; then C="\$SANE_MAX"
+else C="\$N"; fi
+[ "\$N" -lt "\$C" ] && C="\$N"
+if [ "\$C" -lt "\$TIGHT_CTX" ]; then
+  echo "note: \$M has a \$N-token window. That is tight for an agent — the system" >&2
+  echo "      prompt + tool schemas eat a fixed chunk of it, so sessions compress" >&2
+  echo "      early. Switching anyway; the 64K floor was patched out." >&2
 fi
-C="\${HERMES_CTX:-\$MIN_CTX}"; [ "\$N" -lt "\$C" ] && C="\$N"
 "\$HERMES" config set model.default "\$M"
 "\$HERMES" config set model.context_length "\$C"
 "\$HERMES" config set model.ollama_num_ctx "\$C"
@@ -467,8 +531,12 @@ cat <<EOF
   Switch model safely:    $HERMES_DIR/hermes-model
   List model windows:     $HERMES_DIR/hermes-model            (no arguments)
 
+  Re-unlock after upgrading:  $VENV/bin/python $UNLOCK_PY
+  Put the floor back:         $VENV/bin/python $UNLOCK_PY --restore
+  Check patch state:          $VENV/bin/python $UNLOCK_PY --check
+
   Put this in your shell rc so 'hermes' is always on PATH, so the gateway
-  inherits the 64K window, and so TLS verification keeps working:
+  inherits the window, and so TLS verification keeps working:
 
     export PATH="$VENV/bin:$HERMES_DIR:\$PATH"
     export OLLAMA_CONTEXT_LENGTH=$CTX
@@ -476,9 +544,11 @@ cat <<EOF
     export OLLAMA_KV_CACHE_TYPE=q8_0
     [ -f "$HERMES_DIR/certs.env" ] && . "$HERMES_DIR/certs.env"
 
-  If the dashboard ever says a model is "below the minimum 64,000": that is
-  the model's own window, not a setting. Switch with hermes-model — never by
-  editing model.default alone, which leaves a stale context_length behind.
+  The "below the minimum 64,000" rejection is patched out of this install, so
+  any model is selectable. If it ever comes back, a 'pip install --upgrade
+  hermes-agent' or 'hermes update' rewrote site-packages: re-run
+  unlock-context.py. Still switch models with hermes-model rather than editing
+  model.default alone, which leaves a stale context_length behind.
 
 EOF
 
