@@ -358,3 +358,144 @@ $ hermes profile import ./coding.hermesprofile
 ```
 
 A fresh local install starts empty — profiles, souls and skill selections do not travel on their own.
+
+---
+
+## 10. Four sub-agents on one install · captured (stub Ollama)
+
+Provisioning. Four hermes profiles, two brains, one shared board:
+
+```console
+$ bash scripts/setup-agents.sh
+  ✓ hermes: ~/hermes-local/venv/bin/hermes
+  ✓ home:   ~/.hermes
+
+==> Choosing brains
+  ✓ deep brain (designer, coder): llama3.1:8b
+  ✓ fast brain (researcher, planner): llama3.2:1b
+  ✓ llama3.1:8b @ 131072 tokens · llama3.2:1b @ 131072 tokens
+
+==> Provisioning profiles in ~/.hermes/profiles
+  ✓ researcher — created
+✓ Set model.default = llama3.2:1b in ~/.hermes/profiles/researcher/config.yaml
+✓ Set model.context_length = 131072 in ~/.hermes/profiles/researcher/config.yaml
+  ✓ researcher -> llama3.2:1b @ 131072 tokens
+  ...
+  ✓ coder -> llama3.1:8b @ 131072 tokens
+
+==> Initialising the shared task board
+  ✓ board created: ~/.hermes/kanban.db
+
+==> Installing the 'hermes-agents' controller at ~/hermes-local/hermes-agents
+  ✓ hermes-agents installed
+```
+
+The whole design rests on one fact — a profile owns its own config file, so
+per-agent model and window need no invention:
+
+```console
+$ hermes -p coder config path
+~/.hermes/profiles/coder/config.yaml
+
+$ cat ~/.hermes/profiles/coder/config.yaml
+model:
+  provider: custom
+  base_url: http://localhost:11434/v1
+  default: llama3.1:8b
+  context_length: 131072
+  ollama_num_ctx: 131072
+```
+
+Who they are:
+
+```console
+$ hermes-agents
+AGENT        BRAIN                  WINDOW    ROLE
+researcher   llama3.2:1b            131072    Finds things out. Web search, documentation, source-
+planner      llama3.2:1b            131072    Turns a goal into an ordered, verifiable plan. Break
+designer     llama3.1:8b            131072    Interface and product design. Layout, hierarchy, typ
+coder        llama3.1:8b            131072    Writes, edits and debugs code. Reads the repo first,
+
+board: ~/.hermes/kanban.db
+```
+
+The ROLE column is each profile's `--description`, and it is not decoration:
+the kanban decomposer routes tasks by reading it, rather than guessing from
+the profile name.
+
+Repointing one brain moves all three keys together, the same way `hermes-model`
+does for the main install — and says out loud what a third distinct model costs:
+
+```console
+$ hermes-agents model researcher qwen2.5:32b
+researcher -> qwen2.5:32b @ 32768 tokens (native 32768)
+note: every distinct model you add is another one Ollama has to keep
+      resident — fewer distinct brains means less evict-and-reload.
+```
+
+32,768 is accepted without argument. On a stock install that model is refused
+outright — see session 7.
+
+Queueing work and watching the board:
+
+```console
+$ hermes-agents task researcher "compare qwen2.5:32b and llama3.1:8b for tool calling"
+Created t_d944b3dd  (ready, assignee=researcher)
+queued for researcher — run 'hermes-agents up' if the dispatcher isn't running
+
+$ hermes-agents board
+▶ t_d944b3dd  ready     researcher            compare qwen2.5:32b and llama3.1:8b for tool calling
+
+$ hermes-agents status
+dispatcher: stopped  —  start it with: hermes-agents up
+
+NAME                  ON DISK   COUNTS
+coder                 yes       (idle)
+designer              yes       (idle)
+planner               yes       (idle)
+researcher            yes       ready=1
+
+By status:
+  ready     1
+  running   0
+  blocked   0
+  done      0
+
+Oldest ready task age: 1s
+```
+
+A card sitting in `ready` forever is the single most common surprise here:
+nothing on the board moves without a dispatcher.
+
+```console
+$ hermes-agents up
+dispatcher up (pid 10258, tick 30s)
+log: ~/hermes-local/kanban-daemon.log
+
+$ hermes-agents up
+dispatcher already running (pid 10258)
+
+$ hermes-agents down
+dispatcher stopped
+```
+
+`up` checks for a running gateway first and bows out if it finds one — the
+gateway embeds its own dispatcher, and two dispatchers race for claims. It also
+re-reads the pidfile after starting rather than assuming: if the daemon exits,
+you get the tail of its log and a non-zero exit, not a cheerful lie.
+
+What actually makes them four different agents is `SOUL.md` — the profile's
+system prompt. Stock profile creation seeds it with the generic Hermes soul,
+which is exactly what would leave you with one agent wearing four name tags:
+
+```console
+$ head -3 ~/.hermes/profiles/coder/SOUL.md
+You are the coder on a small local agent team. You make changes that work on
+the machine, not changes that look right in a message.
+
+Read before you write. Find how the codebase already does this thing and follow
+it — its conventions beat your preferences. Make the smallest change that solves
+the problem, in the fewest files.
+
+$ hermes-agents soul designer      # opens $EDITOR on that file
+```

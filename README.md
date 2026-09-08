@@ -36,6 +36,7 @@ bash bootstrap.sh --model qwen2.5:32b    # override the auto-sized model
 bash bootstrap.sh --ctx 32768            # cap the window (a cap, not a target)
 bash bootstrap.sh --keep-64k-guard       # leave hermes-agent's 64K floor alone
 bash bootstrap.sh --no-dashboard         # install and configure only
+bash bootstrap.sh --no-agents            # skip the four sub-agent profiles
 bash bootstrap.sh --port 9200            # dashboard port (default 9119)
 bash bootstrap.sh --dir ~/hermes-local   # where the venv lives
 bash bootstrap.sh --home ~/.hermes       # HERMES_HOME (config + data)
@@ -209,6 +210,71 @@ note: qwen2.5:32b has a 32768-token window. That is tight for an agent — the s
 
 ---
 
+## Four sub-agents on the one install
+
+The bootstrap ends by turning this single install into four specialists:
+
+| agent | brain | what it is for |
+|---|---|---|
+| `researcher` | fast | finds things out — search, docs, source-checking, returns facts with URLs |
+| `planner` | fast | turns a goal into ordered, verifiable steps and says who does each one |
+| `designer` | deep | layout, hierarchy, type, colour, copy, critique of existing screens |
+| `coder` | deep | reads the repo, makes focused changes, runs the build, fixes what breaks |
+
+They are **hermes profiles**, not four installs. That matters because a profile already carries everything an agent needs to be its own agent:
+
+```bash
+hermes -p coder config path
+# ~/.hermes/profiles/coder/config.yaml     <- its own model, its own window
+```
+
+Each one gets its own `config.yaml`, its own `SOUL.md` (the system prompt — this repo writes a real role persona over the generic stock one), and its own skills, sessions, memories and workspace. One venv, one pip install, one unlocked 64K floor, inherited by all four.
+
+### Two brains, not four
+
+Ollama keeps a limited number of models resident — `OLLAMA_MAX_LOADED_MODELS`, and on CPU it is effectively one. Four distinct models means an evict-and-reload on every handoff. So `researcher` and `planner` share a small fast model, `designer` and `coder` share the big one.
+
+The deep brain is whatever `bootstrap.sh` already configured and verified. The fast one is only ever chosen from models **already on disk** — a setup script has no business starting a 5 GB download behind your back. If there is nothing smaller installed, all four share the one model and it tells you so:
+
+```
+! no smaller model on disk — researcher and planner will share llama3.1:8b
+!   give them a faster brain later:
+!     ollama pull llama3.2:3b && ~/hermes-local/hermes-agents model researcher llama3.2:3b
+```
+
+### Driving them
+
+```bash
+hermes-agents                                 # who they are, what they run on
+hermes-agents chat coder                      # talk to one directly
+hermes-agents soul designer                   # edit a persona
+hermes-agents model researcher llama3.2:3b    # repoint one brain (model + window together)
+hermes-agents task coder "fix the failing build"
+hermes-agents plan "ship the landing page"    # decompose a goal across all four
+hermes-agents swarm "audit the site"          # parallel workers -> verifier -> synthesizer
+hermes-agents board                           # the task board
+hermes-agents up | down | status              # the dispatcher
+hermes-agents logs coder
+```
+
+### How they hand work to each other
+
+Through hermes' own kanban board — a SQLite task board at `~/.hermes/kanban.db` shared by every profile. Cards are claimed atomically, can depend on each other, and each one is executed by a named profile in an isolated workspace.
+
+That is why every profile here is created with a `--description`: the kanban decomposer routes work by **role**, reading those descriptions, rather than guessing from the profile name. `hermes-agents plan "..."` parks a card in triage and lets the decomposer split it; `hermes-agents swarm "..."` builds the parallel graph directly — researcher, designer and coder in parallel, `planner` verifying and writing it up.
+
+**Nothing on the board moves on its own.** Either run `hermes-agents up` (a standalone dispatcher, ticking every 30s) or leave the dashboard running — its gateway embeds a dispatcher on `kanban.dispatch_interval_seconds`. Do not run both: they race for claims, which is exactly why `hermes kanban daemon` refuses to start unforced while a gateway is up.
+
+Re-running `scripts/setup-agents.sh` is safe — existing profiles are updated in place, never recreated. It also re-asserts each role's description and `SOUL.md`, so editing the role definitions in that script and re-running is how you change what an agent is. Per-agent model overrides made with `hermes-agents model` get reset by a re-run; pass `--fast` / `--big` to make them stick.
+
+```bash
+bash scripts/setup-agents.sh --dry-run
+bash scripts/setup-agents.sh --agents coder,planner       # subset
+bash scripts/setup-agents.sh --fast llama3.2:3b --big qwen2.5:32b
+```
+
+---
+
 ## Daily use
 
 Put this in your shell rc — the `PATH` entry, the window, and the certificate bundle all need to be inherited by the gateway process, not just by your interactive shell:
@@ -321,10 +387,14 @@ Also note pip ships **0.19.0**, which trails the newest container builds slightl
 ```
 ~/hermes-local/venv/         virtualenv (hermes, hermes-acp, hermes-agent)
 ~/hermes-local/hermes-model  model switcher (model + context_length + num_ctx)
+~/hermes-local/hermes-agents controller for the four sub-agents
 scripts/unlock-context.py    removes the 64K floor (--check / --restore)
+scripts/setup-agents.sh      provisions researcher / planner / designer / coder
 ~/hermes-local/certs.env     SSL_CERT_FILE exports, if TLS needed fixing
 ~/hermes-local/ollama.log    ollama serve output
 ~/.hermes/config.yaml        your Hermes config (HERMES_HOME)
+~/.hermes/profiles/<name>/   one sub-agent: config.yaml, SOUL.md, skills, sessions
+~/.hermes/kanban.db          the task board they share
 ~/.ollama/models/            downloaded weights
 ```
 

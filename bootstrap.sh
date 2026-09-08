@@ -6,6 +6,7 @@
 #   bash bootstrap.sh --model llama3.1:8b
 #   bash bootstrap.sh --ctx 131072    # cap the window (more RAM per token)
 #   bash bootstrap.sh --no-dashboard
+#   bash bootstrap.sh --no-agents     # skip the four sub-agent profiles
 #   bash bootstrap.sh --dry-run       # print the plan, touch nothing
 #   bash bootstrap.sh --keep-64k-guard  # leave hermes-agent's 64K floor alone
 #
@@ -25,6 +26,13 @@
 # Re-run the unlock after any 'pip install --upgrade hermes-agent' / 'hermes
 # update' — an upgrade rewrites site-packages and puts the floor back.
 #
+# FOUR SUB-AGENTS. Section 7c hands off to scripts/setup-agents.sh, which turns
+# this one install into four specialists — researcher, planner, designer, coder
+# — as hermes PROFILES. Each gets its own config.yaml (own model, own window),
+# its own SOUL.md, its own skills, sessions, memories and workspace, all on the
+# same venv and the same unlocked floor. They coordinate through hermes' shared
+# kanban board. Pass --no-agents to skip it.
+#
 # Safe to re-run: every step checks before it acts.
 # Verified against hermes-agent 0.19.0 (pip) on Python 3.13.
 # ---------------------------------------------------------------------------
@@ -39,6 +47,7 @@ DASH_PORT="${DASH_PORT:-9119}"
 DASH_HOST="${DASH_HOST:-127.0.0.1}"
 MODEL=""
 WANT_DASH=1
+WANT_AGENTS=1
 DRY=0
 UNLOCK=1
 
@@ -66,9 +75,10 @@ while [ $# -gt 0 ]; do
     --home)           export HERMES_HOME="${2:?}"; shift 2 ;;
     --dir)            HERMES_DIR="${2:?}"; VENV="$HERMES_DIR/venv"; shift 2 ;;
     --no-dashboard)   WANT_DASH=0; shift ;;
+    --no-agents)      WANT_AGENTS=0; shift ;;
     --keep-64k-guard) UNLOCK=0; shift ;;
     --dry-run)        DRY=1; shift ;;
-    -h|--help)        sed -n '2,30p' "$0"; exit 0 ;;
+    -h|--help)        sed -n '2,39p' "$0"; exit 0 ;;
     *) echo "unknown flag: $1" >&2; exit 2 ;;
   esac
 done
@@ -86,6 +96,7 @@ have() { command -v "$1" >/dev/null 2>&1; }
 # Where scripts/unlock-context.py lives, relative to this script.
 SELF_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]:-$0}")" && pwd)"
 UNLOCK_PY="$SELF_DIR/scripts/unlock-context.py"
+AGENTS_SH="$SELF_DIR/scripts/setup-agents.sh"
 
 # ----------------------------- 1. machine ----------------------------------
 step "Inspecting this machine"
@@ -501,6 +512,32 @@ SWITCHER
   ok "hermes-model installed — run it with no args to list windows"
 fi
 
+# --------------------------- 7c. sub-agents --------------------------------
+# One install, four specialists. hermes-agent already has the mechanism —
+# profiles — and each profile carries its own config.yaml, so per-agent model
+# and window are native, not a hack:
+#     hermes -p coder config path -> $HERMES_HOME/profiles/coder/config.yaml
+# They share this venv, this unlocked floor and one kanban board.
+if [ "$WANT_AGENTS" = 1 ]; then
+  step "Setting up the four sub-agents (researcher, planner, designer, coder)"
+  if [ ! -f "$AGENTS_SH" ]; then
+    warn "scripts/setup-agents.sh not found next to this script — skipping"
+    warn "  clone the whole repo rather than downloading bootstrap.sh alone"
+  else
+    AGENT_ARGS=(--hermes "$HERMES" --dir "$HERMES_DIR" --home "$HERMES_HOME" --big "$MODEL")
+    [ "$DRY" = 1 ] && AGENT_ARGS+=(--dry-run)
+    # Never fatal: a working single-agent install is the important outcome.
+    if OLLAMA_URL="$OLLAMA_URL" bash "$AGENTS_SH" "${AGENT_ARGS[@]}"; then
+      ok "four agents provisioned — drive them with $HERMES_DIR/hermes-agents"
+    else
+      warn "sub-agent setup failed — the main install is fine; retry with:"
+      warn "  bash $AGENTS_SH --hermes $HERMES --dir $HERMES_DIR"
+    fi
+  fi
+else
+  ok "skipping sub-agents (--no-agents). Add them later: bash $AGENTS_SH"
+fi
+
 # ----------------------------- 8. verify -----------------------------------
 step "Verifying the model answers through the OpenAI-compatible endpoint"
 
@@ -531,6 +568,12 @@ cat <<EOF
   Switch model safely:    $HERMES_DIR/hermes-model
   List model windows:     $HERMES_DIR/hermes-model            (no arguments)
 
+  Your four sub-agents:   $HERMES_DIR/hermes-agents           (no arguments)
+  Talk to one:            $HERMES_DIR/hermes-agents chat coder
+  Give one a task:        $HERMES_DIR/hermes-agents task researcher "compare X and Y"
+  Split a goal up:        $HERMES_DIR/hermes-agents plan "ship the landing page"
+  Start the dispatcher:   $HERMES_DIR/hermes-agents up
+
   Re-unlock after upgrading:  $VENV/bin/python $UNLOCK_PY
   Put the floor back:         $VENV/bin/python $UNLOCK_PY --restore
   Check patch state:          $VENV/bin/python $UNLOCK_PY --check
@@ -549,6 +592,11 @@ cat <<EOF
   hermes-agent' or 'hermes update' rewrote site-packages: re-run
   unlock-context.py. Still switch models with hermes-model rather than editing
   model.default alone, which leaves a stale context_length behind.
+
+  The sub-agents are hermes profiles under $HERMES_HOME/profiles — each with
+  its own config.yaml, SOUL.md, skills, sessions and memories. Cards on the
+  shared board at $HERMES_HOME/kanban.db only move while a dispatcher runs:
+  either 'hermes-agents up', or the dashboard, whose gateway embeds one.
 
 EOF
 
