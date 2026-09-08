@@ -82,9 +82,15 @@ have() { command -v "$1" >/dev/null 2>&1; }
 if [ -z "$HERMES" ]; then
   if   [ -x "$HERMES_DIR/venv/bin/hermes" ]; then HERMES="$HERMES_DIR/venv/bin/hermes"
   elif have hermes;                          then HERMES="$(command -v hermes)"
+  elif [ "$DRY" = 1 ];                       then HERMES="$HERMES_DIR/venv/bin/hermes"
   else die "no hermes binary found. Run bootstrap.sh first, or pass --hermes /path/to/hermes"; fi
 fi
-[ -x "$HERMES" ] || die "not executable: $HERMES"
+if [ ! -x "$HERMES" ]; then
+  # A dry run is allowed to describe an install that does not exist yet — that
+  # is the whole point of running it before bootstrap has built the venv.
+  [ "$DRY" = 1 ] || die "not executable: $HERMES"
+  warn "not installed yet: $HERMES (dry run — describing what would happen)"
+fi
 ok "hermes: $HERMES"
 ok "home:   $HERMES_HOME"
 
