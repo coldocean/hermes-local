@@ -12,6 +12,8 @@ It detects your OS and RAM, installs Hermes from PyPI into a virtualenv, install
 
 Safe to re-run — every step checks before it acts.
 
+See [docs/terminal-examples.md](docs/terminal-examples.md) for real captured terminal sessions.
+
 ---
 
 ## Requirements
