@@ -46,7 +46,7 @@ set -euo pipefail
 
 HERMES_DIR="${HERMES_DIR:-$HOME/hermes-local}"
 export HERMES_HOME="${HERMES_HOME:-$HOME/.hermes}"
-OLLAMA_URL="${OLLAMA_URL:-http://localhost:11434}"
+OLLAMA_URL="${OLLAMA_URL:-http://172.20.10.2:11434}"
 HERMES="${HERMES:-}"
 AGENTS="researcher,planner,designer,coder"
 FAST=""

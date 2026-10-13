@@ -3,3 +3,6 @@ ollama.log
 __pycache__/
 *.pyc
 .DS_Store
+# секреты — никогда не коммитить
+.env
+*.secret

@@ -7,6 +7,8 @@
 #   bash bootstrap.sh --ctx 131072    # cap the window (more RAM per token)
 #   bash bootstrap.sh --no-dashboard
 #   bash bootstrap.sh --no-agents     # skip the four sub-agent profiles
+#   bash bootstrap.sh --cloud-brain   # main model on OpenRouter (private provider)
+#   bash bootstrap.sh --no-searxng    # skip the local SearXNG search engine
 #   bash bootstrap.sh --dry-run       # print the plan, touch nothing
 #   bash bootstrap.sh --keep-64k-guard  # leave hermes-agent's 64K floor alone
 #
@@ -33,10 +35,61 @@
 # same venv and the same unlocked floor. They coordinate through hermes' shared
 # kanban board. Pass --no-agents to skip it.
 #
+# PRIVACY + COST BY DEFAULT. Section 7d runs scripts/hermes-harden.py so a
+# freshly stood-up config comes out private-by-default instead of
+# leaking-by-default:
+#   * every auxiliary/background LLM call (compression, titles, approval,
+#     vision, curator, web_extract, kanban triage) runs on the LOCAL Ollama
+#     instead of on free OpenRouter endpoints;
+#   * the fallback chain is the local model, not a free cloud endpoint;
+#   * provider_routing pins OpenRouter to the providers that neither train on
+#     nor retain prompts, and asks for provider.data_collection=deny, so a
+#     trainer-hosted model (DeepSeek, NVIDIA, Thinking Machines — all three
+#     "train=yes" in OpenRouter's provider policies) can never be reached;
+#   * privacy.redact_pii hashes user ids and strips phone numbers;
+#   * Mixture-of-Agents is off — its reference models were paid, and one
+#     profile pointed at a third-party router (bazaarlink.ai).
+# With --cloud-brain the MAIN model stays on OpenRouter, but on a provider from
+# that whitelist (default z-ai/glm-5.3-flash: no training, no retention, native
+# tool calls, $0.15/$0.50 per M — half the price of the deepseek flash it
+# replaces). Without it the main model is the local one and no prompt leaves
+# the machine. Re-audit any time:  scripts/hermes-harden.py --check
+#
+# LOCAL OLLAMA AS A SERVICE. On macOS section 5b installs a LaunchAgent
+# (scripts/ollama-launchd.sh) rather than a bare `nohup ollama serve`, because
+# three env vars decide whether a 12-14B auxiliary brain is usable on 16 GB:
+# OLLAMA_CONTEXT_LENGTH (aux calls do not send num_ctx, so Ollama's 4096
+# default silently truncates local compression), OLLAMA_FLASH_ATTENTION=1 and
+# OLLAMA_KV_CACHE_TYPE=q8_0.
+#
+# PRIVATE SEARCH. Section 5c installs a local SearXNG (from the official git
+# repo — the PyPI package `searxng` is an unrelated MCP wrapper, not the
+# engine) on 127.0.0.1:8888 and adds SEARXNG_URL to $HERMES_HOME/.env, so
+# web_search stays on the machine. The hardening pass (7d) then sets
+# web.search_backend: searxng in every config. web_extract (fetching a specific
+# page) still goes through the configured extraction backend — SearXNG is
+# search-only.
+#
 # Safe to re-run: every step checks before it acts.
 # Verified against hermes-agent 0.19.0 (pip) on Python 3.13.
 # ---------------------------------------------------------------------------
 set -euo pipefail
+
+# Guard: запуск через `hermes --profile <p>` может оставить в $HOME профильный
+# хвост (~/.hermes/profiles/<p>/home) — тогда весь скрипт построит всё в чужом
+# профиле. Ловим и возвращаем настоящий дом.
+case "$HOME" in
+  */.hermes/profiles/*|*/.hermes)
+    REAL="$({ command -v dscl >/dev/null 2>&1 \
+              && dscl . -read "/Users/$(whoami)" NFSHomeDirectory 2>/dev/null \
+              | awk '{print $2}'; } || true)"
+    [ -d "$REAL" ] || REAL="$(getent passwd "$(id -u)" 2>/dev/null | cut -d: -f6 || true)"
+    if [ -n "$REAL" ] && [ "$REAL" != "$HOME" ] && [ -d "$REAL" ]; then
+      printf '⚠  $HOME указывает в профиль Hermes (%s) — переключаю на настоящий дом: %s\n' "$HOME" "$REAL"
+      export HOME="$REAL"
+      case "${HERMES_HOME:-}" in */.hermes/profiles/*) export HERMES_HOME="$REAL/.hermes" ;; esac
+    fi ;;
+esac
 
 # ----------------------------- settings ------------------------------------
 HERMES_DIR="${HERMES_DIR:-$HOME/hermes-local}"
@@ -44,12 +97,28 @@ VENV="$HERMES_DIR/venv"
 export HERMES_HOME="${HERMES_HOME:-$HOME/.hermes}"
 OLLAMA_URL="${OLLAMA_URL:-http://localhost:11434}"
 DASH_PORT="${DASH_PORT:-9119}"
-DASH_HOST="${DASH_HOST:-127.0.0.1}"
+#DASH_HOST="${DASH_HOST:-172.20.10.2}"
+# Жёсткий IP устаревает при смене Wi-Fi — биндим все интерфейсы (0.0.0.0):
+# дашборд закрыт своим логином/паролем (dashboard.basic_auth), а --insecure
+# добавится сам. Хочешь только локально: --host 127.0.0.1 или DASH_HOST=127.0.0.1.
+DASH_HOST="${DASH_HOST:-0.0.0.0}"
 MODEL=""
 WANT_DASH=1
-WANT_AGENTS=1
+WANT_AGENTS=4
+WANT_SEARXNG=1
 DRY=0
 UNLOCK=1
+CLOUD_BRAIN=0
+
+# Local brain trio. BIG does the thinking-side auxiliary work (compression,
+# curator, web_extract), SMALL does the trivial chatty work (titles, approval,
+# mcp), VISION is the only local model that can actually see an image.
+AUX_BIG="${HERMES_AUX_BIG:-qwen3:14b}"
+AUX_SMALL="${HERMES_AUX_SMALL:-qwen2.5:7b}"
+AUX_VISION="${HERMES_AUX_VISION:-gemma3:12b}"
+# Main model when --cloud-brain is set: a provider that neither trains on nor
+# retains prompts, and native tool calling.
+CLOUD_MODEL="${HERMES_CLOUD_MODEL:-z-ai/glm-5.3-flash}"
 
 # CTX is a CAP, not a target. Empty means "use whatever the model natively
 # supports" — 32,768 for qwen2.5, 131,072 for llama3.1, 1,024,000 for
@@ -76,9 +145,11 @@ while [ $# -gt 0 ]; do
     --dir)            HERMES_DIR="${2:?}"; VENV="$HERMES_DIR/venv"; shift 2 ;;
     --no-dashboard)   WANT_DASH=0; shift ;;
     --no-agents)      WANT_AGENTS=0; shift ;;
+    --cloud-brain)    CLOUD_BRAIN=1; shift ;;
+    --no-searxng)     WANT_SEARXNG=0; shift ;;
     --keep-64k-guard) UNLOCK=0; shift ;;
     --dry-run)        DRY=1; shift ;;
-    -h|--help)        sed -n '2,39p' "$0"; exit 0 ;;
+    -h|--help)        awk 'NR>1 && /^set -euo pipefail/{exit} NR>1' "$0"; exit 0 ;;
     *) echo "unknown flag: $1" >&2; exit 2 ;;
   esac
 done
@@ -97,6 +168,9 @@ have() { command -v "$1" >/dev/null 2>&1; }
 SELF_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]:-$0}")" && pwd)"
 UNLOCK_PY="$SELF_DIR/scripts/unlock-context.py"
 AGENTS_SH="$SELF_DIR/scripts/setup-agents.sh"
+HARDEN_PY="$SELF_DIR/scripts/hermes-harden.py"
+OLLAMA_SVC="$SELF_DIR/scripts/ollama-launchd.sh"
+SEARXNG_SETUP="$SELF_DIR/scripts/searxng-setup.sh"
 
 # ----------------------------- 1. machine ----------------------------------
 step "Inspecting this machine"
@@ -304,6 +378,44 @@ else
   ok "ollama api answering on $OLLAMA_URL"
 fi
 
+# --------------------------- 5b. ollama service ----------------------------
+# macOS: replace the fire-and-forget background `ollama serve` above with a
+# KeepAlive LaunchAgent that carries the three env vars that make a local 14B
+# brain usable on 16 GB. This matters most for aux compression: Hermes' aux
+# calls do NOT send num_ctx, so without OLLAMA_CONTEXT_LENGTH every local
+# summarisation silently truncates at Ollama's 4096 default.
+if [ "$OS" = macos ]; then
+  if [ -f "$OLLAMA_SVC" ]; then
+    step "Installing Ollama as a LaunchAgent (ctx=$SERVE_CTX, flash-attn, kv q8_0)"
+    OLLAMA_CONTEXT_LENGTH="$SERVE_CTX" OLLAMA_URL="$OLLAMA_URL" \
+      run bash "$OLLAMA_SVC" install || warn "launchd install failed — the bg 'ollama serve' above is still up"
+  else
+    warn "scripts/ollama-launchd.sh not found — ollama stays a foreground/background process"
+  fi
+else
+  warn "non-macOS: set these in your service unit by hand —"
+  warn "  Environment=OLLAMA_CONTEXT_LENGTH=$SERVE_CTX OLLAMA_FLASH_ATTENTION=1 OLLAMA_KV_CACHE_TYPE=q8_0"
+fi
+
+# --------------------------- 5c. local SearXNG ------------------------------
+# Web search stays on the machine: a SearXNG instance on 127.0.0.1:8888 (json
+# format, autostart) plus SEARXNG_URL in $HERMES_HOME/.env, so Hermes' search
+# goes to the local engine instead of a hosted gateway. The installer pulls
+# the REAL SearXNG from its git repo — the PyPI package named `searxng` is an
+# unrelated third-party MCP wrapper, not the metasearch engine.
+if [ "$WANT_SEARXNG" = 1 ]; then
+  if [ -f "$SEARXNG_SETUP" ]; then
+    step "Installing local SearXNG (127.0.0.1:8888, private web search)"
+    SEARXNG_PYTHON="$PY" HERMES_HOME="$HERMES_HOME" \
+      run bash "$SEARXNG_SETUP" --python "$PY" --home "$HERMES_HOME" --port 8888 \
+      || warn "SearXNG setup failed — search will fall back to whatever is configured"
+  else
+    warn "scripts/searxng-setup.sh not found — search stays on the default backend"
+  fi
+else
+  ok "skipping SearXNG (--no-searxng)"
+fi
+
 # ----------------------------- 6. model ------------------------------------
 step "Choosing a model"
 
@@ -340,8 +452,8 @@ fi
 # usually the better trade on a fixed amount of RAM.
 if   [ "$RAM_GB" -lt 8 ];  then SIZED="llama3.2:1b";      NOTE="wiring proof only — too small to be a useful agent"
 elif [ "$RAM_GB" -lt 16 ]; then SIZED="llama3.2:3b";      NOTE="usable for simple tool calls; ~2 GB weights"
-elif [ "$RAM_GB" -lt 24 ]; then SIZED="llama3.1:8b";      NOTE="the sweet spot for an agent brain; ~5 GB weights, 128K native"
-elif [ "$RAM_GB" -lt 32 ]; then SIZED="qwen2.5:14b";      NOTE="stronger reasoning; ~9 GB weights, 32K native"
+elif [ "$RAM_GB" -lt 24 ]; then SIZED="qwen2.5:7b";       NOTE="the sweet spot for an agent brain; ~5 GB weights, 32K native"
+elif [ "$RAM_GB" -lt 32 ]; then SIZED="qwen3:14b";        NOTE="strongest that actually runs on 16 GB; ~9 GB, native tool calls"
 elif [ "$RAM_GB" -lt 48 ]; then SIZED="qwen2.5:32b";      NOTE="strong local brain; ~20 GB weights, 32K native"
 elif [ "$RAM_GB" -lt 64 ]; then SIZED="devstral:24b";     NOTE="very strong on code/tools; ~14 GB weights, 128K native"
 else                            SIZED="llama3.3:70b";     NOTE="~40 GB download, 128K native"
@@ -365,6 +477,28 @@ else
   step "Pulling $MODEL (this is the slow part)"
   run ollama pull "$MODEL"
 fi
+
+# Measured on a 16 GB M2 Pro: 20B+ models swap hard (gpt-oss:20b: 2.9-5.8
+# tok/s with 7.16 of 8 GB swap in use; qwen2.5:32b worse still). 14B Q4 is the
+# ceiling that still answers at ~15 tok/s. Warn, don't refuse.
+if [ "$RAM_GB" -lt 32 ]; then
+  case "$MODEL" in
+    *:2[0-9]b|*:3[0-9]b|*:4[0-9]b|*:7[0-9]b|*70b)
+      warn "'$MODEL' is 20B+ but this machine has ${RAM_GB} GB — expect heavy swapping."
+      warn "  on 16 GB the practical ceiling is ~14B Q4 (qwen3:14b answers at ~15 tok/s)" ;;
+  esac
+fi
+
+# The auxiliary trio: the models the hardened config points at. Skip on
+# --no-agents-style minimal runs only if the caller asked for a different set.
+step "Pulling the local auxiliary models ($AUX_BIG, $AUX_SMALL, $AUX_VISION)"
+for m in "$AUX_BIG" "$AUX_SMALL" "$AUX_VISION"; do
+  if echo "$INSTALLED" | grep -qx "$m"; then
+    ok "$m already present"
+  else
+    run ollama pull "$m"
+  fi
+done
 
 # Ask the GGUF itself rather than trusting the family name, then run the model
 # at its NATIVE window — clamped down by --ctx / HERMES_CTX if you set one.
@@ -538,6 +672,90 @@ else
   ok "skipping sub-agents (--no-agents). Add them later: bash $AGENTS_SH"
 fi
 
+# ---------------------- 7d. privacy + local-first --------------------------
+# Runs AFTER 7c on purpose: the sub-agent profiles created there carry their own
+# config.yaml, and this step rewrites the main config AND every profile, so a
+# freshly stood-up fleet comes out private-by-default rather than
+# leaking-by-default. Idempotent — re-running changes nothing.
+#   local brain  (default): main = the pulled local model, nothing leaves the box
+#   --cloud-brain        : main = CLOUD_MODEL on OpenRouter, still pinned to
+#                          providers that neither train on nor retain prompts
+if [ -f "$HARDEN_PY" ]; then
+  step "Hardening the config (privacy + cost defaults)"
+  if [ "$CLOUD_BRAIN" = 1 ]; then
+    HARDEN_ARGS=(--main-model "$CLOUD_MODEL" --main-base-url "")
+    ok "main: $CLOUD_MODEL via OpenRouter, whitelisted to non-training providers"
+  else
+    HARDEN_ARGS=(--main-model "$MODEL" --main-base-url "$OLLAMA_URL/v1")
+    ok "main: $MODEL (local — no prompt leaves this machine)"
+  fi
+  ok "auxiliary: $AUX_BIG / $AUX_SMALL / $AUX_VISION on $OLLAMA_URL"
+  [ "$DRY" = 1 ] && HARDEN_ARGS+=(--dry-run)
+  if HERMES_HARDEN_LOCAL_BIG="$AUX_BIG" HERMES_HARDEN_LOCAL_SMALL="$AUX_SMALL" \
+     HERMES_HARDEN_LOCAL_VISION="$AUX_VISION" \
+     "$VENV/bin/python" "$HARDEN_PY" --home "$HERMES_HOME" "${HARDEN_ARGS[@]}" 2>&1 | sed 's/^/  /'; then
+    ok "private-by-default — audit any time: $VENV/bin/python $HARDEN_PY --check"
+  else
+    warn "hardening failed — the install still works, but it is NOT private-default"
+    warn "  retry: $VENV/bin/python $HARDEN_PY --home $HERMES_HOME"
+  fi
+else
+  warn "scripts/hermes-harden.py not found — config NOT hardened:"
+  warn "  aux tasks would run on free (training) cloud endpoints, no provider whitelist"
+fi
+
+# ---------------------- 7e. dashboard главного Агента ----------------------
+# Дашборд Джонни — постоянный сервис, а не «пока открыт терминал»:
+# RunAtLoad + KeepAlive → macOS поднимает его сам при каждом старте машины.
+# Идёт ПОСЛЕ харденинга (7d), чтобы конфиг уже был правильным.
+install_dashboard_service() {
+  local host="$DASH_HOST" port="$DASH_PORT"
+  local pl="$HOME/Library/LaunchAgents/ai.hermes.dashboard.plist"
+  local args=("$VENV/bin/hermes" dashboard --host "$host" --port "$port" --no-open)
+  case "$host" in 127.0.0.1|localhost) ;; *) args+=(--insecure) ;; esac
+  mkdir -p "$(dirname "$pl")" "$HERMES_HOME/logs"
+  launchctl bootout "gui/$(id -u)/ai.hermes.dashboard" >/dev/null 2>&1 || true
+  cat > "$pl" <<PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+  <key>Label</key><string>ai.hermes.dashboard</string>
+  <key>ProgramArguments</key>
+  <array>$(for a in "${args[@]}"; do printf '\n    <string>%s</string>' "$a"; done)
+  </array>
+  <key>EnvironmentVariables</key>
+  <dict><key>HERMES_HOME</key><string>$HERMES_HOME</string></dict>
+  <key>WorkingDirectory</key><string>$HOME</string>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+  <key>StandardOutPath</key><string>$HERMES_HOME/logs/dashboard.log</string>
+  <key>StandardErrorPath</key><string>$HERMES_HOME/logs/dashboard.error.log</string>
+</dict></plist>
+PLIST
+  launchctl bootstrap "gui/$(id -u)" "$pl" 2>/dev/null \
+    || launchctl kickstart -k "gui/$(id -u)/ai.hermes.dashboard" >/dev/null 2>&1 || true
+  for _ in $(seq 1 15); do
+    curl -fsS -o /dev/null --max-time 2 "http://$host:$port/" 2>/dev/null && { ok "dashboard отвечает на http://$host:$port (автозапуск при загрузке машины)"; return 0; }
+    sleep 1
+  done
+  warn "dashboard не ответил за 15 с — лог: $HERMES_HOME/logs/dashboard.error.log"
+}
+
+if [ "$OS" = macos ]; then
+  if [ "$DRY" = 0 ]; then
+    step "Raising the chief Agent's dashboard as a boot-persistent service"
+    install_dashboard_service
+  else
+    echo "  would install: ai.hermes.dashboard on $DASH_HOST:$DASH_PORT (RunAtLoad+KeepAlive)"
+  fi
+  case "$DASH_HOST" in 127.0.0.1|localhost) ;; *)
+    warn "дашборд слушает $DASH_HOST — он отдаёт API-ключи в локальную сеть;"
+    warn "  на машине с чужим Wi-Fi ставь 127.0.0.1:9119 или закрой доступ (файрвол/VPN)" ;;
+  esac
+else
+  warn "не macOS: дашборд как systemd --user unit — см. fleet-transfer-linux (там же клиент)"
+fi
+
 # ----------------------------- 8. verify -----------------------------------
 step "Verifying the model answers through the OpenAI-compatible endpoint"
 
@@ -577,6 +795,19 @@ cat <<EOF
   Re-unlock after upgrading:  $VENV/bin/python $UNLOCK_PY
   Put the floor back:         $VENV/bin/python $UNLOCK_PY --restore
   Check patch state:          $VENV/bin/python $UNLOCK_PY --check
+
+  Privacy audit:              $VENV/bin/python $HARDEN_PY --check
+  Re-harden after edits:      $VENV/bin/python $HARDEN_PY --home $HERMES_HOME
+  Ollama service status:      bash $OLLAMA_SVC status
+  Ollama service restart:     bash $OLLAMA_SVC install
+  SearXNG (private search):   127.0.0.1:8888 — status:  bash $SELF_DIR/scripts/searxng-launchd.sh status
+
+  What the hardening did (and why) is in the header of $HARDEN_PY: the main
+  model and every auxiliary task now avoid providers that train on or retain
+  prompts — DeepSeek, NVIDIA and Thinking Machines all do both, and they were
+  carrying the whole default config. Auxiliary work (compression, titles,
+  approval, vision, curator) runs locally on $OLLAMA_URL, the fallback chain is
+  local, and privacy.redact_pii is on.
 
   Put this in your shell rc so 'hermes' is always on PATH, so the gateway
   inherits the window, and so TLS verification keeps working:
